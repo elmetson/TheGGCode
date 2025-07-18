@@ -3,12 +3,21 @@ import { RaceInput, ValidationErrors } from '../types';
 import { COUNTRIES, VENUES } from '../utils/constants';
 import { getUserTimezone, getCountryTimezone, getUserLocation, formatTimeWithTimezone, getTodayDateString } from '../utils/timezone';
 import { validateForm } from '../utils/validation';
+import { getRaceData, RaceData } from '../utils/apiClient';
+import { saveRaceSearch, RaceSearch } from '../utils/supabaseClient';
 
 interface RaceInputFormProps {
   onSubmit: (raceInput: RaceInput) => void;
+  setRaceData: (data: RaceData[]) => void;
+  setApiStatus: (status: { 
+    health: string; 
+    rateLimitRemaining: number | null; 
+    rateLimitReset: number | null; 
+    dataQuality: string 
+  }) => void;
 }
 
-const RaceInputForm: React.FC<RaceInputFormProps> = ({ onSubmit }) => {
+const RaceInputForm: React.FC<RaceInputFormProps> = ({ onSubmit, setRaceData, setApiStatus }) => {
   const [country, setCountry] = useState('');
   const [venue, setVenue] = useState('');
   const [date, setDate] = useState('');
@@ -17,6 +26,8 @@ const RaceInputForm: React.FC<RaceInputFormProps> = ({ onSubmit }) => {
   const [raceTimezone, setRaceTimezone] = useState('');
   const [timezoneNote, setTimezoneNote] = useState('');
   const [errors, setErrors] = useState<ValidationErrors>({});
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   
   const [countryFilter, setCountryFilter] = useState('');
   const [venueFilter, setVenueFilter] = useState('');
@@ -87,6 +98,10 @@ const RaceInputForm: React.FC<RaceInputFormProps> = ({ onSubmit }) => {
     setCountryFilter(selectedCountry.name);
     setShowCountryDropdown(false);
     setErrors(prev => ({ ...prev, country: undefined }));
+    
+    // Update race timezone when country changes
+    const raceTz = getCountryTimezone(selectedCountry.code);
+    setRaceTimezone(raceTz);
   };
 
   const handleVenueSelect = (selectedVenue: string) => {
@@ -96,21 +111,136 @@ const RaceInputForm: React.FC<RaceInputFormProps> = ({ onSubmit }) => {
     setErrors(prev => ({ ...prev, venue: undefined }));
   };
 
-  const handleSubmit = useCallback((e: React.FormEvent) => {
+  const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     
     const formErrors = validateForm(country, venue, date, time);
     setErrors(formErrors);
     
-    if (Object.keys(formErrors).length === 0) {
-      console.log('Submit button clicked - Race Input:', { country, venue, date, time });
-      console.log('User timezone:', userTimezone);
-      console.log('Race timezone:', raceTimezone);
-      console.log('No API connected - this is Phase 1 UI only');
-      
-      onSubmit({ country, venue, date, time });
+    if (Object.keys(formErrors).length > 0) {
+      return;
     }
-  }, [country, venue, date, time, userTimezone, raceTimezone, onSubmit]);
+
+    setLoading(true);
+    setError(null);
+    
+    console.log('Starting race analysis...');
+    console.log('Form data:', { country, venue, date, time, userTimezone, raceTimezone });
+
+    const raceInput = { country, venue, date, time };
+    onSubmit(raceInput);
+
+    try {
+      // Prepare search input
+      const searchInput = {
+        country,
+        venue,
+        date,
+        time,
+        user_timezone: userTimezone,
+        race_timezone: raceTimezone
+      };
+
+      // Get race data from APIs
+      const { raceData, searchResponse } = await getRaceData(searchInput);
+      
+      console.log(`Successfully retrieved ${raceData.length} horses`);
+      
+      // Update UI with race data
+      setRaceData(raceData);
+      
+      // Update API status
+      const apiStatus = {
+        health: searchResponse.status === 200 ? 'Connected' : 'Error',
+        rateLimitRemaining: searchResponse.headers['x-ratelimit-remaining'] 
+          ? Number(searchResponse.headers['x-ratelimit-remaining']) 
+          : null,
+        rateLimitReset: searchResponse.headers['x-ratelimit-reset'] 
+          ? Number(searchResponse.headers['x-ratelimit-reset']) 
+          : null,
+        dataQuality: raceData.length >= 5 ? 'High' : raceData.length >= 3 ? 'Medium' : 'Low'
+      };
+      setApiStatus(apiStatus);
+
+      // Prepare data for Supabase
+      const raceSearchData: RaceSearch = {
+        user_id: null, // Single user for Phase 2
+        country,
+        venue,
+        date,
+        time,
+        user_timezone: userTimezone,
+        race_timezone: raceTimezone,
+        search_query: `horse racing ${venue} ${date} race card runners odds`,
+        api_response: searchResponse.data,
+        llm_input: JSON.stringify({
+          system: 'Extract horse racing data from web search results',
+          user: `Race: ${venue}, ${date}, ${time} (${country})`
+        }),
+        llm_output: raceData,
+        api_status: searchResponse.status.toString(),
+        rate_limit_remaining: apiStatus.rateLimitRemaining,
+        rate_limit_reset: apiStatus.rateLimitReset,
+        data_quality: apiStatus.dataQuality,
+        error_message: null,
+        llm_brave_config: {
+          llm_model: 'meta-llama/llama-3.3-70b-instruct:free',
+          brave_endpoint: 'web',
+          prompt_version: '2.0'
+        },
+        timestamp: new Date().toISOString()
+      };
+
+      // Save to Supabase (non-blocking)
+      await saveRaceSearch(raceSearchData);
+
+    } catch (apiError: any) {
+      console.error('API Error:', apiError.message);
+      setError(apiError.message);
+      
+      // Update API status to show error
+      setApiStatus({
+        health: 'Error',
+        rateLimitRemaining: null,
+        rateLimitReset: null,
+        dataQuality: 'N/A'
+      });
+
+      // Save error to Supabase (non-blocking)
+      try {
+        const errorRaceSearchData: RaceSearch = {
+          user_id: null,
+          country,
+          venue,
+          date,
+          time,
+          user_timezone: userTimezone,
+          race_timezone: raceTimezone,
+          search_query: `horse racing ${venue} ${date} race card runners odds`,
+          api_response: null,
+          llm_input: null,
+          llm_output: null,
+          api_status: 'Error',
+          rate_limit_remaining: null,
+          rate_limit_reset: null,
+          data_quality: 'N/A',
+          error_message: apiError.message,
+          llm_brave_config: {
+            llm_model: 'meta-llama/llama-3.3-70b-instruct:free',
+            brave_endpoint: 'web',
+            prompt_version: '2.0'
+          },
+          timestamp: new Date().toISOString()
+        };
+        
+        await saveRaceSearch(errorRaceSearchData);
+      } catch (supabaseError) {
+        console.error('Failed to save error to Supabase:', supabaseError);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [country, venue, date, time, userTimezone, raceTimezone, onSubmit, setRaceData, setApiStatus]);
 
   return (
     <div className="bg-white p-6 rounded-lg shadow-md">
@@ -130,10 +260,11 @@ const RaceInputForm: React.FC<RaceInputFormProps> = ({ onSubmit }) => {
             onFocus={() => setShowCountryDropdown(true)}
             className="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             placeholder="Select country..."
+            disabled={loading}
           />
           {errors.country && <p className="text-red-500 text-sm mt-1">{errors.country}</p>}
           
-          {showCountryDropdown && filteredCountries.length > 0 && (
+          {showCountryDropdown && filteredCountries.length > 0 && !loading && (
             <div className="absolute z-10 w-full bg-white border border-gray-300 rounded mt-1 max-h-40 overflow-y-auto">
               {filteredCountries.map((c) => (
                 <div
@@ -162,10 +293,11 @@ const RaceInputForm: React.FC<RaceInputFormProps> = ({ onSubmit }) => {
             onFocus={() => setShowVenueDropdown(true)}
             className="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             placeholder="Enter venue..."
+            disabled={loading}
           />
           {errors.venue && <p className="text-red-500 text-sm mt-1">{errors.venue}</p>}
           
-          {showVenueDropdown && filteredVenues.length > 0 && venueFilter && (
+          {showVenueDropdown && filteredVenues.length > 0 && venueFilter && !loading && (
             <div className="absolute z-10 w-full bg-white border border-gray-300 rounded mt-1 max-h-40 overflow-y-auto">
               {filteredVenues.map((v) => (
                 <div
@@ -192,6 +324,7 @@ const RaceInputForm: React.FC<RaceInputFormProps> = ({ onSubmit }) => {
             }}
             className="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             placeholder="19/07/2025"
+            disabled={loading}
           />
           {errors.date && <p className="text-red-500 text-sm mt-1">{errors.date}</p>}
         </div>
@@ -208,6 +341,7 @@ const RaceInputForm: React.FC<RaceInputFormProps> = ({ onSubmit }) => {
             }}
             className="w-full p-2 border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             placeholder="14:30"
+            disabled={loading}
           />
           {errors.time && <p className="text-red-500 text-sm mt-1">{errors.time}</p>}
           {timezoneNote && (
@@ -218,10 +352,37 @@ const RaceInputForm: React.FC<RaceInputFormProps> = ({ onSubmit }) => {
         {/* Submit Button */}
         <button
           type="submit"
-          className="w-full bg-blue-600 text-white p-2 rounded hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+          disabled={loading}
+          className={`w-full p-2 rounded focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${
+            loading 
+              ? 'bg-gray-400 text-white cursor-not-allowed' 
+              : 'bg-blue-600 text-white hover:bg-blue-700'
+          }`}
         >
-          Start Analysis
+          {loading ? 'Analyzing Race...' : 'Start Analysis'}
         </button>
+
+        {/* Error Display */}
+        {error && (
+          <div className="bg-red-50 border border-red-200 rounded p-3">
+            <p className="text-red-600 text-sm">{error}</p>
+            <p className="text-xs text-gray-500 mt-1">
+              Check console for detailed error information.
+            </p>
+          </div>
+        )}
+
+        {/* Loading Status */}
+        {loading && (
+          <div className="bg-blue-50 border border-blue-200 rounded p-3">
+            <p className="text-blue-600 text-sm">
+              🔍 Searching for race data...
+            </p>
+            <p className="text-xs text-gray-500 mt-1">
+              This may take 10-30 seconds depending on data availability.
+            </p>
+          </div>
+        )}
       </form>
     </div>
   );
